@@ -358,13 +358,13 @@ class CheckpointManager:
         self.storage.append_stats([json.dumps(s) for s in stats])
 
     def read_stats(
-        self
+        self,
     ) -> Generator[Dict[str, Union[int, SerializedStats]], None, None]:
         for line in self.storage.load_stats():
             yield json.loads(line)
 
     def maybe_read_stats(
-        self
+        self,
     ) -> Generator[Dict[str, Union[int, SerializedStats]], None, None]:
         try:
             yield from self.read_stats()
