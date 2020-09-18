@@ -9,6 +9,8 @@
 import errno
 import json
 import logging
+import os
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +26,6 @@ from torchbiggraph.plugin import URLPluginRegistry
 from torchbiggraph.tensorlist import TensorList
 from torchbiggraph.types import Partition
 from torchbiggraph.util import CouldNotLoadData, allocate_shared_tensor, div_roundup
-
 
 logger = logging.getLogger("torchbiggraph")
 
@@ -247,6 +248,127 @@ class FileRelationTypeStorage(AbstractRelationTypeStorage):
         return load_names(self.get_names_file())
 
 
+def _is_file_gcs(fs, gcs_path):
+    return len(fs.ls(gcs_path)) == 1
+
+
+# TODO: refactor other GCS pieces of code out to helper functions as well
+
+
+@RELATION_TYPE_STORAGES.register_as("gs")
+class GCSRelationTypeStorage(AbstractRelationTypeStorage):
+    import blocks
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        # TODO: benchmark GCSFileSystem vs GCSNativeFileSystem
+        # I *think* this is type-safe.
+        self.fs = blocks.filesystem.GCSFileSystem()
+
+    def get_count_file(self) -> str:
+        return os.path.join(self.path, "dynamic_rel_count.txt")
+
+    def get_names_file(self) -> str:
+        return os.path.join(self.path, "dynamic_rel_names.json")
+
+    def prepare(self) -> None:
+        # blob storage does not require making directories
+        pass
+
+    def has_count(self) -> bool:
+        return _is_file_gcs(self.fs, self.get_count_file())
+
+    def save_count(self, count: int) -> None:
+        with tempfile.TemporaryFile(mode="wt") as tf:
+            tf.write(f"{count}\n")
+            self.fs.cp(tf, self.get_count_file())
+
+    def load_count(self) -> int:
+        try:
+            with self.fs.open(self.get_count_file(), mode="rt") as tf:
+                return int(tf.read().strip())
+        # TODO: check which error actually gets thrown
+        except FileNotFoundError as err:
+            raise CouldNotLoadData() from err
+
+    def has_names(self) -> bool:
+        return _is_file_gcs(self.fs, self.get_names_file())
+
+    def save_names(self, names: List[str]) -> None:
+        with tempfile.TemporaryFile(mode="wt") as tf:
+            json.dump(names, tf, indent=4)
+            self.fs.cp(tf, self.get_names_file())
+
+    def load_names(self) -> List[str]:
+        try:
+            with self.fs.open(self.get_names_file(), mode="rt") as tf:
+                return json.load(tf)
+        # TODO: check which error actually gets thrown
+        except FileNotFoundError as err:
+            raise CouldNotLoadData() from err
+
+
+@ENTITY_STORAGES.register_as("gs")
+class GCSEntityStorage(AbstractEntityStorage):
+    import blocks
+    import tempfile
+    import os
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        # TODO: benchmark GCSFileSystem vs GCSNativeFileSystem
+        # I *think* this is type-safe.
+        self.fs = blocks.filesystem.GCSFileSystem()
+
+    def get_count_file(self, entity_name: str, partition: Partition) -> str:
+        return os.path.join(self.path, f"entity_count_{entity_name}_{partition}.txt")
+
+    def get_names_file(self, entity_name: str, partition: Partition) -> str:
+        return os.path.join(self.path, f"entity_names_{entity_name}_{partition}.json")
+
+    def prepare(self) -> None:
+        # not need to "create folder" since GCS is blob storage
+        pass
+
+    def has_count(self, entity_name: str, partition: Partition) -> bool:
+        return _is_file_gcs(self.fs, self.get_count_file(entity_name, partition))
+
+    def save_count(self, entity_name: str, partition: Partition, count: int) -> None:
+        with tempfile.TemporaryFile(mode="wt") as tf:
+            tf.write(f"{count}\n")
+            self.fs.cp(tf, self.get_count_file(entity_name, partition))
+
+    def load_count(self, entity_name: str, partition: Partition) -> int:
+        try:
+            with self.fs.open(
+                self.get_count_file(entity_name, partition), mode="rt"
+            ) as tf:
+                return int(tf.read().strip())
+        # TODO: check which error actually gets thrown
+        except FileNotFoundError as err:
+            raise CouldNotLoadData() from err
+
+    def has_names(self, entity_name: str, partition: Partition) -> bool:
+        return _is_file_gcs(self.fs, self.get_names_file(entity_name, partition))
+
+    def save_names(
+        self, entity_name: str, partition: Partition, names: List[str]
+    ) -> None:
+        with tempfile.TemporaryFile(mode="wt") as tf:
+            json.dump(names, tf, indent=4)
+            self.fs.cp(tf, self.get_names_file(entity_name, partition))
+
+    def load_names(self, entity_name: str, partition: Partition) -> List[str]:
+        try:
+            with self.fs.open(
+                self.get_names_file(entity_name, partition), mode="rt"
+            ) as tf:
+                return json.load(tf)
+        # TODO: check which error actually gets thrown
+        except FileNotFoundError as err:
+            raise CouldNotLoadData() from err
+
+
 # Names and values of metadata attributes for the HDF5 files.
 FORMAT_VERSION_ATTR = "format_version"
 FORMAT_VERSION = 1
@@ -423,7 +545,9 @@ class FileEdgeStorage(AbstractEdgeStorage):
                 end = min((chunk_idx + 1) * chunk_size, num_edges)
                 chunk_size = end - begin
 
-                allocator = allocate_shared_tensor if shared else torch.empty
+                allocator: torch.Tensor = (
+                    allocate_shared_tensor if shared else torch.empty
+                )
                 lhs = allocator((chunk_size,), dtype=torch.long)
                 rhs = allocator((chunk_size,), dtype=torch.long)
                 rel = allocator((chunk_size,), dtype=torch.long)
@@ -455,7 +579,7 @@ class FileEdgeStorage(AbstractEdgeStorage):
         except LookupError:
             return TensorList.empty(num_tensors=end - begin)
 
-        allocator = allocate_shared_tensor if shared else torch.empty
+        allocator: torch.Tensor = allocate_shared_tensor if shared else torch.empty
         offsets = allocator((end - begin + 1,), dtype=torch.long)
         offsets_ds.read_direct(offsets.numpy(), source_sel=np.s_[begin : end + 1])
         data_begin = offsets[0].item()
@@ -481,3 +605,27 @@ class FileEdgeStorage(AbstractEdgeStorage):
             hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
             yield appender
         tmp_file_path.rename(file_path)
+
+
+@EDGE_STORAGES.register_as("gs")
+class GCSEdgeStorage(FileEdgeStorage):
+    """Download edges from GCS then read.
+
+    Requires having storage for edges on disk, and assumes
+    that the edges were already created.
+    Also, hardcoding the data storage path, lol.
+    """
+
+    import blocks
+    import tempfile
+    import os
+
+    def __init__(self, path: str) -> None:
+        self.fs = blocks.filesystem.GCSFileSystem()
+        self.gcs_path = path
+        local_path = "/current/graph/data"
+        self.path = Path(local_path).resolve(strict=False)
+
+    def prepare(self) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.fs.cp(self.gcs_path, self.path, recursive=True)
