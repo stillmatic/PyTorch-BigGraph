@@ -30,7 +30,6 @@ from torchbiggraph.tensorlist import TensorList
 from torchbiggraph.types import Bucket, FloatTensorType, LongTensorType, Side
 from torchbiggraph.util import CouldNotLoadData, EmbeddingHolder, match_shape
 
-
 logger = logging.getLogger("torchbiggraph")
 
 
@@ -58,7 +57,11 @@ class SimpleEmbedding(AbstractEmbedding):
         return self.get(input_.to_tensor())
 
     def get(self, input_: LongTensorType) -> FloatTensorType:
-        return F.embedding(input_, self.weight, max_norm=self.max_norm, sparse=True)
+        try:
+            return F.embedding(input_, self.weight, max_norm=self.max_norm, sparse=True)
+        except IndexError:
+            logger.warning(torch.max(input_), torch.min(input_))
+            raise
 
     def get_all_entities(self) -> FloatTensorType:
         return self.get(
